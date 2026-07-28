@@ -576,3 +576,359 @@ async def test_nested_deployed_acknowledgement_is_bound_before_running_transitio
                 deployed_receipt=changed,
                 now=datetime(2026, 7, 10, 0, 0, 2, tzinfo=UTC),
             )
+
+
+# Live production 409 reproduction (2026-07-28 review-cvm e2e):
+
+# assignment.app_identity was a 40-hex advisory pin; Phala provision minted a
+
+# different app_id handle. Prod still pinned receipt.app_id == app_identity →
+
+# branch (2) in mark_review_deployed (validate_review_deployed_acknowledgement).
+
+_LIVE_ASSIGNMENT_APP_IDENTITY_PIN = "f024ea2315052843d0afd775b2b82b2d2455c798"
+
+_LIVE_DISCOVERED_PHALA_APP_ID = "49b6c172d0361da1213efa314614a049442a47d5"
+
+
+def _review_config_with_hex_pin(public_key_hex: str) -> ReviewInputConfig:
+    """Assignment pin is 40-hex (live shape); compose name stays product moniker."""
+
+    compose = review_compose.generate_review_app_compose(
+        review_image=REVIEW_IMAGE,
+        app_identity=review_compose.DEFAULT_REVIEW_APP_IDENTITY,
+    )
+
+    compose_hash = review_compose.review_app_compose_hash(compose)
+
+    entries = (_allowlisted(compose_hash),)
+
+    return ReviewInputConfig(
+        image_ref=REVIEW_IMAGE,
+        compose_hash=compose_hash,
+        app_identity=_LIVE_ASSIGNMENT_APP_IDENTITY_PIN,
+        kms_public_key_hex=public_key_hex,
+        measurement=MEASUREMENT,
+        measurement_allowlist=entries,
+        measurement_allowlist_sha256=canonical_sha256({"entries": list(entries)}),
+    )
+
+
+async def test_mark_review_deployed_accepts_discovered_app_id_not_assignment_pin(
+    database_session,
+) -> None:
+    """S1 live path: receipt.app_id may differ from assignment.app_identity."""
+
+    private_key = X25519PrivateKey.generate()
+
+    public_key_hex = (
+        private_key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+
+    config = _review_config_with_hex_pin(public_key_hex)
+
+    assert config.app_identity == _LIVE_ASSIGNMENT_APP_IDENTITY_PIN
+
+    assert config.app_identity != _LIVE_DISCOVERED_PHALA_APP_ID
+
+    submission_bytes = b"review-discovered-app-id-artifact"
+
+    submission = AgentSubmission(
+        miner_hotkey="review-miner-discovered",
+        name="review-agent-discovered",
+        agent_hash=hashlib.sha256(submission_bytes).hexdigest(),
+        artifact_uri="/tmp/review-discovered.zip",
+        artifact_path="/tmp/review-discovered.zip",
+        zip_sha256=hashlib.sha256(submission_bytes).hexdigest(),
+        zip_size_bytes=len(submission_bytes),
+        raw_status="review_queued",
+        effective_status="queued",
+    )
+
+    async with database_session() as session:
+        session.add(submission)
+
+        await session.flush()
+
+        created = await create_review_session(
+            session,
+            submission=submission,
+            artifact_bytes=submission_bytes,
+            rules_files={".rules/policy.md": b"review"},
+            rules_revision_id="rules-v1",
+            settings=ChallengeSettings(shared_token="review-token"),
+            input_config=config,
+            now=datetime(2026, 7, 28, 5, 20, 26, tzinfo=UTC),
+        )
+
+        assignment = json.loads(created.assignment.assignment_bytes)
+
+        pin = assignment["assignment_core"]["review_app"]["app_identity"]
+
+        assert pin == _LIVE_ASSIGNMENT_APP_IDENTITY_PIN
+
+        acknowledgement = build_review_deployed_acknowledgement(
+            assignment=assignment,
+            cvm_id="5d58298e-2003-492b-8465-95d34e27f3b6",
+            request_id="5d58298e-2003-492b-8465-95d34e27f3b6",
+            receipt_sha256="dc07d0e3acb4f767c6b95ce77881912201bce62a3f0abbc71c8f520a5a51d1a0",
+            created_at_ms=0,
+            app_id=_LIVE_DISCOVERED_PHALA_APP_ID,
+        )
+
+        assert acknowledgement["phala_create_receipt"]["app_id"] == _LIVE_DISCOVERED_PHALA_APP_ID
+
+        assert acknowledgement["phala_create_receipt"]["app_id"] != pin
+
+        deployed = await mark_review_deployed(
+            session,
+            session_row=created.session,
+            expected_assignment_id=created.assignment.assignment_id,
+            deployed_receipt=acknowledgement,
+            now=datetime(2026, 7, 28, 5, 20, 43, tzinfo=UTC),
+        )
+
+        assert deployed.phase == "review_cvm_running"
+
+        assert deployed.deployed_receipt_json is not None
+
+        assert deployed.deployed_at is not None
+
+
+async def test_mark_review_deployed_idempotent_identical_receipt(
+    database_session,
+) -> None:
+    """S3: re-ack of the exact same receipt must not 409."""
+
+    private_key = X25519PrivateKey.generate()
+
+    public_key_hex = (
+        private_key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+
+    config = _review_config_with_hex_pin(public_key_hex)
+
+    submission_bytes = b"review-idempotent-ack-artifact"
+
+    submission = AgentSubmission(
+        miner_hotkey="review-miner-idem",
+        name="review-agent-idem",
+        agent_hash=hashlib.sha256(submission_bytes).hexdigest(),
+        artifact_uri="/tmp/review-idem.zip",
+        artifact_path="/tmp/review-idem.zip",
+        zip_sha256=hashlib.sha256(submission_bytes).hexdigest(),
+        zip_size_bytes=len(submission_bytes),
+        raw_status="review_queued",
+        effective_status="queued",
+    )
+
+    async with database_session() as session:
+        session.add(submission)
+
+        await session.flush()
+
+        created = await create_review_session(
+            session,
+            submission=submission,
+            artifact_bytes=submission_bytes,
+            rules_files={".rules/policy.md": b"review"},
+            rules_revision_id="rules-v1",
+            settings=ChallengeSettings(shared_token="review-token"),
+            input_config=config,
+            now=datetime(2026, 7, 28, 5, 20, 26, tzinfo=UTC),
+        )
+
+        assignment = json.loads(created.assignment.assignment_bytes)
+
+        acknowledgement = build_review_deployed_acknowledgement(
+            assignment=assignment,
+            cvm_id="cvm-idem-1",
+            request_id="req-idem-1",
+            receipt_sha256="a" * 64,
+            created_at_ms=0,
+            app_id=_LIVE_DISCOVERED_PHALA_APP_ID,
+        )
+
+        first = await mark_review_deployed(
+            session,
+            session_row=created.session,
+            expected_assignment_id=created.assignment.assignment_id,
+            deployed_receipt=acknowledgement,
+            now=datetime(2026, 7, 28, 5, 20, 43, tzinfo=UTC),
+        )
+
+        assert first.phase == "review_cvm_running"
+
+        receipt_json = first.deployed_receipt_json
+
+        second = await mark_review_deployed(
+            session,
+            session_row=created.session,
+            expected_assignment_id=created.assignment.assignment_id,
+            deployed_receipt=acknowledgement,
+            now=datetime(2026, 7, 28, 5, 20, 50, tzinfo=UTC),
+        )
+
+        assert second.phase == "review_cvm_running"
+
+        assert second.deployed_receipt_json == receipt_json
+
+
+async def test_mark_review_deployed_rejects_rebound_receipt_after_deploy(
+    database_session,
+) -> None:
+    """S2: a different receipt after a successful deploy still conflicts."""
+
+    private_key = X25519PrivateKey.generate()
+
+    public_key_hex = (
+        private_key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+
+    config = _review_config_with_hex_pin(public_key_hex)
+
+    submission_bytes = b"review-rebound-ack-artifact"
+
+    submission = AgentSubmission(
+        miner_hotkey="review-miner-rebound",
+        name="review-agent-rebound",
+        agent_hash=hashlib.sha256(submission_bytes).hexdigest(),
+        artifact_uri="/tmp/review-rebound.zip",
+        artifact_path="/tmp/review-rebound.zip",
+        zip_sha256=hashlib.sha256(submission_bytes).hexdigest(),
+        zip_size_bytes=len(submission_bytes),
+        raw_status="review_queued",
+        effective_status="queued",
+    )
+
+    async with database_session() as session:
+        session.add(submission)
+
+        await session.flush()
+
+        created = await create_review_session(
+            session,
+            submission=submission,
+            artifact_bytes=submission_bytes,
+            rules_files={".rules/policy.md": b"review"},
+            rules_revision_id="rules-v1",
+            settings=ChallengeSettings(shared_token="review-token"),
+            input_config=config,
+            now=datetime(2026, 7, 28, 5, 20, 26, tzinfo=UTC),
+        )
+
+        assignment = json.loads(created.assignment.assignment_bytes)
+
+        acknowledgement = build_review_deployed_acknowledgement(
+            assignment=assignment,
+            cvm_id="cvm-rebound-1",
+            request_id="req-rebound-1",
+            receipt_sha256="b" * 64,
+            created_at_ms=0,
+            app_id=_LIVE_DISCOVERED_PHALA_APP_ID,
+        )
+
+        await mark_review_deployed(
+            session,
+            session_row=created.session,
+            expected_assignment_id=created.assignment.assignment_id,
+            deployed_receipt=acknowledgement,
+            now=datetime(2026, 7, 28, 5, 20, 43, tzinfo=UTC),
+        )
+
+        rebound = copy.deepcopy(acknowledgement)
+
+        rebound["cvm_id"] = "cvm-rebound-OTHER"
+
+        rebound["phala_create_receipt"] = dict(rebound["phala_create_receipt"])
+
+        rebound["phala_create_receipt"]["cvm_id"] = "cvm-rebound-OTHER"
+
+        rebound["phala_create_receipt"]["receipt_sha256"] = "c" * 64
+
+        with pytest.raises(ReviewConflict, match="conflicts with prior receipt"):
+            await mark_review_deployed(
+                session,
+                session_row=created.session,
+                expected_assignment_id=created.assignment.assignment_id,
+                deployed_receipt=rebound,
+                now=datetime(2026, 7, 28, 5, 20, 50, tzinfo=UTC),
+            )
+
+
+async def test_mark_review_deployed_rejects_unbound_compose_hash(
+    database_session,
+) -> None:
+    """S2b: compose_hash rebound is still rejected (trust anchor intact)."""
+
+    private_key = X25519PrivateKey.generate()
+
+    public_key_hex = (
+        private_key.public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        .hex()
+    )
+
+    config = _review_config_with_hex_pin(public_key_hex)
+
+    submission_bytes = b"review-unbound-compose-artifact"
+
+    submission = AgentSubmission(
+        miner_hotkey="review-miner-unbound",
+        name="review-agent-unbound",
+        agent_hash=hashlib.sha256(submission_bytes).hexdigest(),
+        artifact_uri="/tmp/review-unbound.zip",
+        artifact_path="/tmp/review-unbound.zip",
+        zip_sha256=hashlib.sha256(submission_bytes).hexdigest(),
+        zip_size_bytes=len(submission_bytes),
+        raw_status="review_queued",
+        effective_status="queued",
+    )
+
+    async with database_session() as session:
+        session.add(submission)
+
+        await session.flush()
+
+        created = await create_review_session(
+            session,
+            submission=submission,
+            artifact_bytes=submission_bytes,
+            rules_files={".rules/policy.md": b"review"},
+            rules_revision_id="rules-v1",
+            settings=ChallengeSettings(shared_token="review-token"),
+            input_config=config,
+            now=datetime(2026, 7, 28, 5, 20, 26, tzinfo=UTC),
+        )
+
+        assignment = json.loads(created.assignment.assignment_bytes)
+
+        acknowledgement = build_review_deployed_acknowledgement(
+            assignment=assignment,
+            cvm_id="cvm-unbound-1",
+            request_id="req-unbound-1",
+            receipt_sha256="d" * 64,
+            created_at_ms=0,
+            app_id=_LIVE_DISCOVERED_PHALA_APP_ID,
+        )
+
+        bad = copy.deepcopy(acknowledgement)
+
+        bad["compose_identity"] = dict(bad["compose_identity"])
+
+        bad["compose_identity"]["compose_hash"] = "e" * 64
+
+        with pytest.raises(ReviewConflict, match="not bound to immutable review assignment"):
+            await mark_review_deployed(
+                session,
+                session_row=created.session,
+                expected_assignment_id=created.assignment.assignment_id,
+                deployed_receipt=bad,
+                now=datetime(2026, 7, 28, 5, 20, 43, tzinfo=UTC),
+            )
