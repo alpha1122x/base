@@ -171,6 +171,11 @@ def test_eval_encrypted_env_contains_only_scoped_capabilities_and_is_transmitted
             "secret_delivery": {"env_key": "EVAL_RUN_TOKEN", "token": token},
         },
     )
+    artifact_env = eval_deploy.build_eval_artifact_env_values(
+        plan,
+        secret="test-shared-token",
+        api_base_url="https://chain.joinbase.ai/challenges/agent-challenge",
+    )
     encrypted = eval_deploy.encrypt_eval_secrets(
         plan,
         {
@@ -190,6 +195,7 @@ def test_eval_encrypted_env_contains_only_scoped_capabilities_and_is_transmitted
                 }
             ),
             "CHALLENGE_PHALA_VALIDATOR_NONCE": plan.plan["score_nonce"],
+            **artifact_env,
         },
     )
     assert encrypted.ciphertext
@@ -199,6 +205,8 @@ def test_eval_encrypted_env_contains_only_scoped_capabilities_and_is_transmitted
         "CHALLENGE_PHALA_ATTESTATION_ENABLED",
         "CHALLENGE_PHALA_AGENT_HASH",
         "CHALLENGE_PHALA_CANONICAL_MEASUREMENT",
+        "CHALLENGE_PHALA_EVAL_ARTIFACT_TOKEN",
+        "CHALLENGE_PHALA_EVAL_ARTIFACT_URL",
         "CHALLENGE_PHALA_EVAL_PLAN",
         "CHALLENGE_PHALA_VALIDATOR_NONCE",
         "LLM_COST_LIMIT",
@@ -214,13 +222,23 @@ def test_eval_encrypted_env_contains_only_scoped_capabilities_and_is_transmitted
 
 
 def test_lifecycle_budget_counts_review_and_eval_together():
+    # Defaults include stage disk (review 20GB + eval 100GB) billed with compute.
     estimate = lifecycle.projected_lifecycle_cost_usd(
         review_instance_type="tdx.small",
         eval_instance_type="tdx.small",
         review_runtime_hours=100,
         eval_runtime_hours=100,
     )
-    assert estimate == pytest.approx(11.6)
+    assert estimate == pytest.approx(13.268)
+    compute_only = lifecycle.projected_lifecycle_cost_usd(
+        review_instance_type="tdx.small",
+        eval_instance_type="tdx.small",
+        review_runtime_hours=100,
+        eval_runtime_hours=100,
+        review_disk_size_gb=20,
+        eval_disk_size_gb=20,
+    )
+    assert compute_only == pytest.approx(12.156)
     with pytest.raises(lifecycle.LifecycleBudgetError):
         lifecycle.validate_lifecycle_budget(
             review_instance_type="tdx.small",

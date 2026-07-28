@@ -34,6 +34,12 @@ from .evaluator.distributed_contract import (
 )
 from .evaluator.interface import DEFAULT_TRAINING_ENTRYPOINT, PrismContext
 from .evaluator.modes import execution_mode_from_value
+from .evaluator.plagiarism_adjudicator import (
+    adjudicate_plagiarism,
+)
+from .evaluator.plagiarism_adjudicator import (
+    config_from_settings as plagiarism_llm_config_from_settings,
+)
 from .evaluator.review_rules import ReviewRule, load_review_rules
 from .evaluator.sandbox import SandboxViolation, inspect_code
 from .evaluator.scoring import ScoreValidationError, score_prequential_bpb
@@ -56,7 +62,46 @@ DEFAULT_REVIEW_RULES = (
 CONTAINER_EXECUTION_BACKENDS = frozenset(
     {"base_container", "base_gpu", "container_gpu", "docker_gpu"}
 )
+#: Always-on backends (no constation bundle required at worker construction).
 SUPPORTED_EXECUTION_BACKENDS = CONTAINER_EXECUTION_BACKENDS
+#: Lium is gated: permitted only when a full constation bundle is present (todo 19).
+LIUM_EXECUTION_BACKEND = "lium"
+GATED_EXECUTION_BACKENDS = frozenset({LIUM_EXECUTION_BACKEND})
+
+
+def is_execution_backend_supported(
+    backend: str,
+    *,
+    constation_bundle: object | None = None,
+) -> bool:
+    """Whether ``backend`` may be used under the current constation gate.
+
+    Container backends (``base_gpu``, …) are always allowed. ``lium`` is allowed
+    **only** when a full constation bundle object is supplied — bare Lium without
+    a bundle stays rejected. This does not evaluate ``constation_ok``; that is the
+    ingestion elevation path (todos 21–22).
+    """
+    if backend in SUPPORTED_EXECUTION_BACKENDS:
+        return True
+    if backend == LIUM_EXECUTION_BACKEND:
+        return constation_bundle is not None
+    return False
+
+
+def require_execution_backend(
+    backend: str,
+    *,
+    constation_bundle: object | None = None,
+) -> None:
+    """Raise ``ValueError`` when ``backend`` is not permitted under the gate."""
+    if is_execution_backend_supported(backend, constation_bundle=constation_bundle):
+        return
+    if backend == LIUM_EXECUTION_BACKEND:
+        raise ValueError(
+            f"Unsupported execution backend: {backend}: constation bundle required for lium"
+        )
+    raise ValueError(f"Unsupported execution backend: {backend}")
+
 
 logger = logging.getLogger(__name__)
 
@@ -140,17 +185,28 @@ class PrismWorker:
         settings: PrismSettings | None = None,
         evaluator_factory: EvaluatorFactory | None = None,
         checkpoint_publisher: CheckpointPublisher | None = None,
+        constation_bundle: object | None = None,
     ) -> None:
-        if execution_backend not in SUPPORTED_EXECUTION_BACKENDS:
-            raise ValueError(f"Unsupported execution backend: {execution_backend}")
+        require_execution_backend(execution_backend, constation_bundle=constation_bundle)
         self.repository = repository
         self.ctx = ctx
         self.execution_backend = execution_backend
         self.settings = settings or PrismSettings()
         self._evaluator_factory = evaluator_factory or _default_evaluator_factory
         self._checkpoint_publisher = checkpoint_publisher
+        self._constation_bundle = constation_bundle
 
     async def process_next(self) -> str | None:
+        # Worker-plane ownership (VAL-PRISM-037 / product policy): when the plane is ON,
+        # miner-funded workers run GPU/container eval. The master-embedded Prism challenge
+        # must NEVER claim or Docker-evaluate submissions here — claim races remove units
+        # from list_pending_prism_work_units and breaks Lium assignment. Finalization is
+        # finalize_worker_result only. cpu_reexec_test_mode keeps the intentional local path.
+        if (
+            self.settings.worker_plane.enabled
+            and not self.settings.worker_plane.cpu_reexec_test_mode
+        ):
+            return None
         submission = await self.repository.claim_next()
         if submission is None:
             return None
@@ -262,7 +318,10 @@ class PrismWorker:
         repeated (the honest run is deterministic, so an honest worker's hash reproduces). Returns
         ``None`` on any replay failure, resolving the audit inconclusive rather than confirming it.
         """
-        if self.execution_backend not in CONTAINER_EXECUTION_BACKENDS:
+        # Lium runs are miner-side; validator audit replay uses the same container path.
+        if self.execution_backend not in CONTAINER_EXECUTION_BACKENDS and (
+            self.execution_backend != LIUM_EXECUTION_BACKEND
+        ):
             return None
         submission = await self.repository.submission_execution_row(submission_id)
         if submission is None:
@@ -351,7 +410,10 @@ class PrismWorker:
         metadata = cast(dict[str, Any], raw_metadata) if isinstance(raw_metadata, dict) else {}
         hotkey = str(submission.get("hotkey") or "")
         code_hash = str(submission.get("code_hash") or sha256(code.encode()).hexdigest())
-        if self.execution_backend in CONTAINER_EXECUTION_BACKENDS:
+        if (
+            self.execution_backend in CONTAINER_EXECUTION_BACKENDS
+            or self.execution_backend == LIUM_EXECUTION_BACKEND
+        ):
             return await self._process_container(
                 submission_id,
                 code,
@@ -374,6 +436,15 @@ class PrismWorker:
         *,
         resume_checkpoint_ref: str | None = None,
     ) -> str:
+        # Master + worker-plane: GPU/container eval is worker-owned. Never Docker here.
+        if (
+            self.settings.worker_plane.enabled
+            and not self.settings.worker_plane.cpu_reexec_test_mode
+        ):
+            raise RuntimeError(
+                "worker_plane_enabled: master container eval disabled; "
+                "Lium/miners own GPU execution (process_next no-op)"
+            )
         # Static gates run FIRST: a sandbox / param-cap / distributed-contract rejection precedes
         # and SKIPS the LLM review entirely -- no llm_reviews/llm_review_events row and no GPU
         # work for a statically-rejected bundle (VAL-LLM-020, VAL-CONTRACT-018).
@@ -394,8 +465,9 @@ class PrismWorker:
             await self._reject_submission(submission_id, str(exc))
             return submission_id
 
-        # Deterministic similarity/admission runs only AFTER the static gates have passed.
-        # LLM hard-gate approval is removed: no gateway/provider call, no held quarantine.
+        # Similarity/admission runs only AFTER the static gates have passed.
+        # Deterministic gravity ranker + OpenRouter plagiarism adjudicator (not the removed
+        # safety hard-gate / mermaid gateway path).
         try:
             review = await self._review_static_submission(
                 submission_id=submission_id,
@@ -732,7 +804,8 @@ class PrismWorker:
         code_hash: str,
     ) -> StaticReviewOutcome:
         # Invoked ONLY after the static AST sandbox / param-cap / distributed-contract gates have
-        # passed. Deterministic similarity replaces the removed LLM hard-gate and quarantine hold.
+        # passed. Deterministic ranker selects the closest prior; OpenRouter LLM is the sole
+        # verdict authority on borderline/attach pairs (exact hash still hard-rejects).
         await self.repository.store_source_snapshot(
             submission_id=submission_id,
             hotkey=hotkey,
@@ -755,26 +828,104 @@ class PrismWorker:
             top_k=self.settings.plagiarism_top_k,
         )
         if duplicate.candidate is not None:
-            # Borderline duplicate formerly became HELD/quarantine. After gateway removal that
-            # band is terminally rejected (never held) so no submission needs LLM review.
-            rejected = duplicate.rejected or duplicate.held
-            violations = ["duplicate_similarity"] if rejected else []
-            await self.repository.store_plagiarism_review(
-                submission_id=submission_id,
-                candidate_submission_id=duplicate.candidate.submission_id,
-                similarity=float(duplicate.report["source_similarity"]),
-                verdict=rejected,
-                reason=duplicate.reason,
-                violations=violations,
-                report=duplicate.report,
-            )
-            if rejected:
+            # Dual-gate plagiarism:
+            # 1) exact source-hash => hard reject (unambiguous clone, no LLM).
+            # 2) quarantine (borderline scores) or attach (identical architecture graph)
+            #    => ONLY the OpenRouter LLM adjudicator may allow or reject.
+            # 3) allow band below thresholds with a candidate present => pass through.
+            report = dict(duplicate.report)
+            cand = duplicate.candidate
+            if duplicate.rejected and duplicate.outcome == "reject":
+                violations = ["duplicate_similarity", "exact_source_hash"]
+                await self.repository.store_plagiarism_review(
+                    submission_id=submission_id,
+                    candidate_submission_id=cand.submission_id,
+                    similarity=float(report.get("source_similarity") or cand.score),
+                    verdict=True,
+                    reason=duplicate.reason,
+                    violations=violations,
+                    report=report,
+                )
                 return StaticReviewOutcome(
                     code_for_eval,
                     True,
                     reason=duplicate.reason,
                     violations=tuple(violations),
                 )
+
+            needs_llm = duplicate.outcome in {"quarantine", "attach"} or duplicate.held
+            if needs_llm:
+                pair_report = source_similarity.build_pair_report(snapshot, cand.snapshot)
+                pair_report.update(
+                    {
+                        "deterministic_outcome": duplicate.outcome,
+                        "deterministic_reason": duplicate.reason,
+                        "source_similarity": report.get("source_similarity", cand.score),
+                        "graph_similarity": cand.graph_similarity,
+                        "candidate_submission_id": cand.submission_id,
+                        "candidate_hotkey": cand.hotkey,
+                    }
+                )
+                current_code = snapshot.combined_python(
+                    max_chars=int(getattr(self.settings, "plagiarism_llm_max_source_chars", 60_000))
+                )
+                candidate_code = cand.snapshot.combined_python(
+                    max_chars=int(getattr(self.settings, "plagiarism_llm_max_source_chars", 60_000))
+                )
+                llm_cfg = plagiarism_llm_config_from_settings(self.settings)
+                adjudication = adjudicate_plagiarism(
+                    current_code=current_code,
+                    candidate_code=candidate_code,
+                    comparison_report=pair_report,
+                    deterministic_reason=duplicate.reason,
+                    deterministic_outcome=duplicate.outcome,
+                    candidate_submission_id=cand.submission_id,
+                    config=llm_cfg,
+                )
+                report["llm_adjudication"] = {
+                    "plagiarized": adjudication.plagiarized,
+                    "reason": adjudication.reason,
+                    "confidence": adjudication.confidence,
+                    "violations": list(adjudication.violations),
+                    "used_llm": adjudication.used_llm,
+                    "model": adjudication.model,
+                }
+                violations = list(adjudication.violations) or (
+                    ["llm_plagiarism"] if adjudication.plagiarized else []
+                )
+                reason = (
+                    f"llm_plagiarism: {adjudication.reason}"
+                    if adjudication.plagiarized
+                    else f"llm_allow: {adjudication.reason}"
+                )
+                await self.repository.store_plagiarism_review(
+                    submission_id=submission_id,
+                    candidate_submission_id=cand.submission_id,
+                    similarity=float(report.get("source_similarity") or cand.score),
+                    verdict=bool(adjudication.plagiarized),
+                    reason=reason,
+                    violations=violations,
+                    report=report,
+                )
+                if adjudication.plagiarized:
+                    return StaticReviewOutcome(
+                        code_for_eval,
+                        True,
+                        reason=reason,
+                        violations=tuple(violations),
+                    )
+                return StaticReviewOutcome(code_for_eval, False)
+
+            # Candidate present but below borderline thresholds -> allow.
+            await self.repository.store_plagiarism_review(
+                submission_id=submission_id,
+                candidate_submission_id=cand.submission_id,
+                similarity=float(report.get("source_similarity") or cand.score or 0.0),
+                verdict=False,
+                reason=duplicate.reason,
+                violations=[],
+                report=report,
+            )
             return StaticReviewOutcome(code_for_eval, False)
 
         return StaticReviewOutcome(code_for_eval, False)

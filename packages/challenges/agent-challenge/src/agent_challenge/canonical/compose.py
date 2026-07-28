@@ -134,6 +134,10 @@ DEFAULT_ALLOWED_ENVS: tuple[str, ...] = (
     "CHALLENGE_PHALA_AGENT_HASH",
     "CHALLENGE_PHALA_ATTESTATION_ENABLED",
     "CHALLENGE_PHALA_CANONICAL_MEASUREMENT",
+    # Guest artifact import (evaluation/artifact_import.py): HTTPS ZIP URL +
+    # short-lived bearer grant. Values only via encrypted_env at eval deploy.
+    "CHALLENGE_PHALA_EVAL_ARTIFACT_TOKEN",
+    "CHALLENGE_PHALA_EVAL_ARTIFACT_URL",
     "CHALLENGE_PHALA_EVAL_PLAN",
     "CHALLENGE_PHALA_KEY_RELEASE_URL",
     "CHALLENGE_PHALA_RA_TLS_SERVER_CA_PEM",
@@ -148,6 +152,14 @@ DEFAULT_ALLOWED_ENVS: tuple[str, ...] = (
     KEY_RELEASE_TLS_CA_ENV,
     "LLM_COST_LIMIT",
     "EVAL_RUN_TOKEN",
+    # Mid-run progress posts (ProgressReporter) — mirror REVIEW_API_BASE_URL pattern.
+    "EVAL_PROGRESS_BASE_URL",
+    "EVAL_RUN_ID",
+    "EVAL_SUBMISSION_ID",
+    # Private GHCR pull for measured eval image (Phala pre-launch docker login).
+    "DSTACK_DOCKER_PASSWORD",
+    "DSTACK_DOCKER_REGISTRY",
+    "DSTACK_DOCKER_USERNAME",
     # Measured OpenRouter (eval agent inside measured CVM only when product allows).
     # Never Base gateway; keys stay miner/session encrypted_env on attested guests.
     "OPENROUTER_API_KEY",

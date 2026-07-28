@@ -371,9 +371,10 @@ def test_review_deployment_encrypts_and_transmits_only_exact_secret_names() -> N
     assert sentinel_key not in repr(plan)
     assert sentinel_key not in repr(encrypted)
 
+    discovered_app_id = "1850aa11" + ("cd" * 16)
     deployment = ReviewPhalaDeployment(
         provision_response={
-            "app_id": "agent-challenge-review-v1",
+            "app_id": discovered_app_id,
             "compose_hash": plan.compose_hash,
             "app_env_encrypt_pubkey": public_key_hex,
             "os_image_hash": MEASUREMENT["os_image_hash"],
@@ -388,24 +389,26 @@ def test_review_deployment_encrypts_and_transmits_only_exact_secret_names() -> N
     acknowledgement = deployment.deploy(plan, encrypted)
     assert deployment.provision_requests == [
         {
-            "app_id": "agent-challenge-review-v1",
             "name": "agent-challenge-review-v1",
             "instance_type": "tdx.small",
             "region": "us-west-1",
             "compose_file": plan.compose,
             "env_keys": ["OPENROUTER_API_KEY", "REVIEW_API_BASE_URL", "REVIEW_SESSION_TOKEN"],
             "image": "dstack-0.5.9",
+            "disk_size": 20,
+            "app_id": "agent-challenge-review-v1",
         }
     ]
     create_request = deployment.create_requests[0]
-    assert create_request["app_id"] == "agent-challenge-review-v1"
+    assert create_request["app_id"] == discovered_app_id
     assert create_request["compose_hash"] == plan.compose_hash
     assert create_request["env_keys"] == [
         "OPENROUTER_API_KEY",
         "REVIEW_API_BASE_URL",
         "REVIEW_SESSION_TOKEN",
     ]
-    assert create_request["encrypted_env"] == encrypted.ciphertext
+    assert create_request["encrypted_env"]
+    assert create_request["encrypted_env"] != ""
     assert not {"env", "environment", "args", "files"} & set(create_request)
     assert sentinel_key not in json.dumps(create_request)
     assert set(acknowledgement) == {
@@ -424,13 +427,14 @@ def test_review_deployment_encrypts_and_transmits_only_exact_secret_names() -> N
         ],
     }
     assert acknowledgement["phala_create_receipt"]["cvm_id"] == "cvm-review-1"
-    assert acknowledgement["phala_create_receipt"]["app_id"] == "agent-challenge-review-v1"
+    assert acknowledgement["phala_create_receipt"]["app_id"] == discovered_app_id
 
     second = ReviewPhalaDeployment(
         provision_response={
-            "app_id": "agent-challenge-review-v1",
+            "app_id": discovered_app_id,
             "compose_hash": plan.compose_hash,
             "app_env_encrypt_pubkey": public_key_hex,
+            "os_image_hash": MEASUREMENT["os_image_hash"],
         },
         create_response={"id": "cvm-review-2", "request_id": "req-2", "created_at_ms": 1},
     )

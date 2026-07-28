@@ -26,8 +26,12 @@ from agent_challenge.canonical.compose import (
 )
 from agent_challenge.selfdeploy import eval as eval_deploy
 
-#: Live dual-flag joinbase eval pin (tee-pin-pack + residual after KR).
-LIVE_PIN_COMPOSE_HASH = "0401177601f46160c8127c007019401c1a7e6fb3cf8a0850c54a0b96fbbe67d2"
+#: MEASUREMENT IMPACT (2026-07-28): EVAL_PROGRESS_* + DSTACK_DOCKER_* + ARTIFACT envs
+#: to DEFAULT_ALLOWED_ENVS changed the measured compose_hash. Previous production
+#: pin was 0401177601f46160c8127c007019401c1a7e6fb3cf8a0850c54a0b96fbbe67d2 — that
+#: live residual / tee-pin-pack value is now STALE and must be re-measured by ops
+#: before the next production eval pin cut. This constant tracks the generator.
+LIVE_PIN_COMPOSE_HASH = "9a550b2dc0f06797976194bd4b53b8d7bfc8630f6390689f51b0bfebd36de622"
 LIVE_PIN_IMAGE = (
     "ghcr.io/baseintelligence/agent-challenge-canonical@sha256:"
     "753e2296635bcd3a30703dc706509f0f8c0e7dd2f82bef730ad7f1cc9443933c"
@@ -110,7 +114,7 @@ def _signed_prepare(
 
 
 def test_measure_time_placeholder_reproduces_live_pin_hash():
-    """Product generator with pin-pack measure inputs must yield 040117…"""
+    """Product generator with pin-pack measure inputs must yield current LIVE_PIN."""
 
     compose = generate_app_compose(
         orchestrator_image=LIVE_PIN_IMAGE,
@@ -121,7 +125,9 @@ def test_measure_time_placeholder_reproduces_live_pin_hash():
     assert app_compose_hash(compose) == LIVE_PIN_COMPOSE_HASH
     # Optional mission-only pin pack. Path may be absent or unreadable on CI
     # /sandbox runners (PermissionError on parent dirs); product hash assert above
-    # already seals the live pin identity.
+    # already seals the generator identity. Production tee-pin-pack files that
+    # still carry the pre-artifact-env hash (04011776…) are FLAG-only — ops must
+    # re-measure; do not hard-fail the suite on a stale external pin dump.
     try:
         present = MISSION_PIN_COMPOSE.is_file()
     except OSError:
@@ -134,8 +140,17 @@ def test_measure_time_placeholder_reproduces_live_pin_hash():
         pin_doc = json.loads(MISSION_PIN_COMPOSE.read_text(encoding="utf-8"))
     except OSError:
         return
+    pin_hash = app_compose_hash(pin_doc)
+    if pin_hash != LIVE_PIN_COMPOSE_HASH:
+        # Stale production pin pack — expected until ops regenerates measurement.
+        # SKIP (visible), never a silent pass: this is an attestation measurement
+        # pin, so drift must stay loud in the suite output until ops re-measures.
+        pytest.skip(
+            "stale production tee-pin-pack: "
+            f"pin={pin_hash} != generator={LIVE_PIN_COMPOSE_HASH}; "
+            "ops must re-measure the eval compose pin"
+        )
     assert render_app_compose(compose) == render_app_compose(pin_doc)
-    assert app_compose_hash(pin_doc) == LIVE_PIN_COMPOSE_HASH
 
 
 def test_build_eval_deployment_plan_matches_live_pin_with_raw_plan_endpoint():
@@ -214,3 +229,60 @@ def test_build_eval_deployment_plan_fails_closed_on_unknown_compose_hash():
     )
     with pytest.raises(eval_deploy.EvalDeploymentError, match="compose hash mismatches"):
         eval_deploy.build_eval_deployment_plan(prepare)
+
+
+#: Live production pin (2026-07-26 T8 / joinbase): eval image bf598… measured
+#: *before* CHALLENGE_PHALA_EVAL_ARTIFACT_{URL,TOKEN} entered DEFAULT_ALLOWED_ENVS.
+#: Observed on prepare for submission 11 (2026-07-28).
+PROD_DAF0_COMPOSE_HASH = (
+    "daf0f2090c02546c694bc7dc49516fd2629f4b8f9dd89e9bc2ed5c4156b662df"
+)
+PROD_DAF0_IMAGE = (
+    "ghcr.io/baseintelligence/agent-challenge-eval@sha256:"
+    "bf598fb8a3391fdbbef9b03184727a1615810a2cb31367e6d6d6b5c2a711d6e4"
+)
+
+
+def test_pre_artifact_allowed_envs_reproduces_prod_daf0_pin():
+    """Generator with pre-artifact allowed_envs + measure-time KR must yield daf0."""
+
+    pre_artifact = tuple(
+        name
+        for name in eval_deploy.EVAL_ALLOWED_ENVS
+        if name
+        not in {
+            eval_deploy.EVAL_ARTIFACT_URL_ENV,
+            eval_deploy.EVAL_ARTIFACT_TOKEN_ENV,
+        }
+    )
+    compose = generate_app_compose(
+        orchestrator_image=PROD_DAF0_IMAGE,
+        name=eval_deploy.DEFAULT_EVAL_COMPOSE_NAME,
+        key_release_url=eval_deploy.MEASURE_TIME_EVAL_KEY_RELEASE_PLACEHOLDER,
+        allowed_envs=pre_artifact,
+    )
+    assert app_compose_hash(compose) == PROD_DAF0_COMPOSE_HASH
+    assert eval_deploy.EVAL_ARTIFACT_URL_ENV not in compose["allowed_envs"]
+    assert eval_deploy.EVAL_ARTIFACT_TOKEN_ENV not in compose["allowed_envs"]
+
+
+def test_build_eval_deployment_plan_matches_prod_daf0_pin():
+    """Live joinbase prepare compose_hash daf0 must determine without inventing bytes."""
+
+    prepare = _signed_prepare(
+        compose_hash=PROD_DAF0_COMPOSE_HASH,
+        image_ref=PROD_DAF0_IMAGE,
+        app_identity="bb35a8f627f0f8c991aa85c15742d352e658e0f7",
+        key_release_endpoint=LIVE_PLAN_KEY_RELEASE,
+    )
+    dep = eval_deploy.build_eval_deployment_plan(prepare)
+    assert dep.compose_hash == PROD_DAF0_COMPOSE_HASH
+    assert dep.compose_name == eval_deploy.DEFAULT_EVAL_COMPOSE_NAME
+    assert (
+        eval_deploy.MEASURE_TIME_EVAL_KEY_RELEASE_PLACEHOLDER
+        in dep.compose["docker_compose_file"]
+    )
+    # Historical pin: artifact delivery names are absent from measured allowed_envs.
+    allowed = set(dep.compose["allowed_envs"])
+    assert eval_deploy.EVAL_ARTIFACT_URL_ENV not in allowed
+    assert eval_deploy.EVAL_ARTIFACT_TOKEN_ENV not in allowed

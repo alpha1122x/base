@@ -33,6 +33,7 @@ from base.compute import (
     LiumClient,
     TargonClient,
 )
+from base.compute.lium_training_wiring import try_build_lium_capacity_scheduler
 from base.compute.worker_deployment import WORKER_TEMPLATE_NAME
 from base.config import load_settings
 from base.config.policy import production_policy_enabled_for_settings
@@ -549,6 +550,9 @@ def _master_orchestration_driver(
     *,
     worker_service: WorkerCoordinationService | None = None,
     worker_assignment_service: WorkerAssignmentService | None = None,
+    bundle_store: Any | None = None,
+    constation_hook: Any | None = None,
+    constation_pin_source: Any | None = None,
 ) -> MasterOrchestrationDriver:
     """Build the live master orchestration driver (architecture.md sec 4).
 
@@ -587,14 +591,25 @@ def _master_orchestration_driver(
             worker_service=worker_service,
             replication_factor=settings.compute.replication_factor,
         )
+
+        def _bundle_lookup(work_unit_id: str):
+            if bundle_store is None:
+                return None
+            return bundle_store.get(work_unit_id)
+
         worker_reconciler = WorkerReconciliationService(
             session_factory,
             result_forwarder=HttpChallengeResultForwarder(
                 registry,
                 timeout_seconds=settings.master.challenge_timeout_seconds,
                 retries=settings.master.challenge_retries,
+                bundle_lookup=_bundle_lookup if bundle_store is not None else None,
             ),
+            constation_hook=constation_hook,
         )
+    # Master-owned Lium capacity admission (optional). Default off; when
+    # lium_training.enabled, Prism GPU bridge enqueues leases and run_once ticks.
+    lium_scheduler = try_build_lium_capacity_scheduler(settings)
     return MasterOrchestrationDriver(
         assignment_service=assignment_service,
         validator_service=validator_service,
@@ -621,6 +636,11 @@ def _master_orchestration_driver(
         worker_assignment_engine=worker_engine,
         worker_reconciler=worker_reconciler,
         seed=settings.master.orchestration_seed,
+        constation_pin_source=constation_pin_source,
+        prism_dispatch_variant=str(
+            getattr(settings.constation, "prism_dispatch_variant", "cuda") or ""
+        ),
+        lium_scheduler=lium_scheduler,
     )
 
 
@@ -1136,6 +1156,54 @@ def master_proxy(config: Path = typer.Option(Path("config/master.example.yaml"))
     # Live autonomy: the orchestration driver bridges challenge pending work into
     # work_assignments, runs balanced assignment + the full reassignment pass,
     # and folds retry-exhausted units, all on a Settings-driven interval.
+    from datetime import timedelta
+
+    from base.master.constation.allowlist_repository import DigestAllowlistRepository
+    from base.master.constation.attestation_keys import load_attestation_verify_key
+    from base.master.constation.bundle_store import ConstationBundleStore
+    from base.master.constation.custody_keys import (
+        build_constation_runtime,
+        make_constation_pre_forward_hook,
+    )
+    from base.master.constation.nonce_repository import DurableAttestationNonceService
+    from base.master.constation.routes import build_constation_router
+
+    constation_bundle_store = ConstationBundleStore()
+    constation_allowlist_repo = DigestAllowlistRepository(session_factory)
+    constation_nonce_service = DurableAttestationNonceService(
+        session_factory, ttl=timedelta(hours=2)
+    )
+    # Custody + MinerPodBinding + ProductionConstationOrchestrator when enabled
+    # and custody master key is present (fail-closed otherwise; master still boots).
+    constation_runtime = build_constation_runtime(
+        settings,
+        nonce_service=constation_nonce_service,
+        bundle_store=constation_bundle_store,
+    )
+    constation_pod_binding = constation_runtime.pod_binding
+    constation_orchestrator = constation_runtime.orchestrator
+    constation_hook = make_constation_pre_forward_hook(
+        constation_orchestrator,
+        duration_seconds=float(settings.constation.duration_seconds),
+    )
+    # Internal token for master constation check_*/issue/register/bundle.
+    # Reuse admin token when present so ops and prism can share one secret.
+    constation_internal_token = (
+        read_secret(
+            getattr(settings.security, "admin_token", None),
+            getattr(settings.security, "admin_token_file", None),
+        )
+        or "constation-internal"
+    )
+    constation_router = build_constation_router(
+        allowlist_repo=constation_allowlist_repo,
+        nonce_service=constation_nonce_service,
+        bundle_store=constation_bundle_store,
+        internal_token=str(constation_internal_token),
+        attestation_verify_key=load_attestation_verify_key(settings),
+        pod_binding=constation_pod_binding,
+    )
+
     orchestration_driver = _master_orchestration_driver(
         settings,
         session_factory,
@@ -1143,6 +1211,9 @@ def master_proxy(config: Path = typer.Option(Path("config/master.example.yaml"))
         validator_service,
         worker_service=worker_service,
         worker_assignment_service=worker_assignment_service,
+        bundle_store=constation_bundle_store,
+        constation_hook=constation_hook,
+        constation_pin_source=constation_allowlist_repo,
     )
     # Registry-driven challenge deploy (architecture.md sec 4 + sec 9.2): the
     # master reconcile loop turns every ACTIVE registry challenge into a running
@@ -1217,7 +1288,13 @@ def master_proxy(config: Path = typer.Option(Path("config/master.example.yaml"))
         agent_challenge_attested_routes_enabled=(
             settings.master.agent_challenge_attested_routes_enabled
         ),
+        constation_router=constation_router,
     )
+    # Expose constation services for worker-path / ops reachability (optional).
+    if constation_pod_binding is not None:
+        proxy.state.constation_pod_binding = constation_pod_binding
+    if constation_orchestrator is not None:
+        proxy.state.constation_orchestrator = constation_orchestrator
     endpoint = f"{settings.master.proxy_host}:{settings.master.proxy_port}"
     typer.echo(f"Starting proxy API on {endpoint}")
     uvicorn.run(proxy, host=settings.master.proxy_host, port=settings.master.proxy_port)
